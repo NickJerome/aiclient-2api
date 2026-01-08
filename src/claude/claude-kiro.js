@@ -89,6 +89,454 @@ function getSystemRuntimeInfo() {
 
 // Helper functions for tool calls and JSON parsing
 
+// ==================== Thinking 标签解析函数 ====================
+
+/**
+ * 需要跳过的包裹字符
+ * 当 thinking 标签被这些字符包裹时，认为是在引用标签而非真正的标签
+ */
+const QUOTE_CHARS = ['`', '"', "'", '\\', '#', '!', '@', '$', '%', '^', '&', '*', '(', ')', '-', '_', '=', '+', '[', ']', '{', '}', ';', ':', '<', '>', ',', '.', '?', '/'];
+
+/**
+ * 检查指定位置的字符是否是引用字符
+ * @param {string} buffer - 要检查的字符串
+ * @param {number} pos - 位置
+ * @returns {boolean}
+ */
+function isQuoteChar(buffer, pos) {
+    if (pos < 0 || pos >= buffer.length) return false;
+    return QUOTE_CHARS.includes(buffer[pos]);
+}
+
+/**
+ * 查找真正的 thinking 开始标签（不被引用字符包裹）
+ * @param {string} buffer - 要搜索的字符串
+ * @returns {number|null} 开始标签的位置，未找到返回 null
+ */
+function findRealThinkingStartTag(buffer) {
+    const TAG = '<thinking>';
+    let searchStart = 0;
+
+    while (true) {
+        const pos = buffer.indexOf(TAG, searchStart);
+        if (pos === -1) return null;
+
+        // 检查前面是否有引用字符
+        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
+        // 检查后面是否有引用字符
+        const afterPos = pos + TAG.length;
+        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
+
+        // 如果不被引用字符包裹，则是真正的开始标签
+        if (!hasQuoteBefore && !hasQuoteAfter) {
+            return pos;
+        }
+
+        // 继续搜索下一个匹配
+        searchStart = pos + 1;
+    }
+}
+
+/**
+ * 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
+ * @param {string} buffer - 要搜索的字符串
+ * @returns {number|null} 结束标签的位置，未找到返回 null
+ */
+function findRealThinkingEndTag(buffer) {
+    const TAG = '</thinking>';
+    let searchStart = 0;
+
+    while (true) {
+        const pos = buffer.indexOf(TAG, searchStart);
+        if (pos === -1) return null;
+
+        // 检查前面是否有引用字符
+        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
+        // 检查后面是否有引用字符
+        const afterPos = pos + TAG.length;
+        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
+
+        // 如果被引用字符包裹，跳过
+        if (hasQuoteBefore || hasQuoteAfter) {
+            searchStart = pos + 1;
+            continue;
+        }
+
+        // 检查后面的内容
+        const afterContent = buffer.substring(afterPos);
+
+        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
+        if (afterContent.length < 2) {
+            return null;
+        }
+
+        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
+        if (afterContent.startsWith('\n\n')) {
+            return pos;
+        }
+
+        // 不是双换行符，跳过继续搜索
+        searchStart = pos + 1;
+    }
+}
+
+/**
+ * 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
+ * 用于"边界事件"场景：例如 thinking 结束后立刻进入 tool_use，或流结束
+ * @param {string} buffer - 要搜索的字符串
+ * @returns {number|null} 结束标签的位置，未找到返回 null
+ */
+function findRealThinkingEndTagAtBufferEnd(buffer) {
+    const TAG = '</thinking>';
+    let searchStart = 0;
+
+    while (true) {
+        const pos = buffer.indexOf(TAG, searchStart);
+        if (pos === -1) return null;
+
+        // 检查前面是否有引用字符
+        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
+        // 检查后面是否有引用字符
+        const afterPos = pos + TAG.length;
+        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
+
+        if (hasQuoteBefore || hasQuoteAfter) {
+            searchStart = pos + 1;
+            continue;
+        }
+
+        // 只有当标签后面全部是空白字符时才认定为结束标签
+        if (buffer.substring(afterPos).trim() === '') {
+            return pos;
+        }
+
+        searchStart = pos + 1;
+    }
+}
+
+/**
+ * Thinking 流处理上下文
+ */
+class ThinkingStreamContext {
+    constructor(thinkingEnabled = false) {
+        this.thinkingEnabled = thinkingEnabled;
+        this.thinkingBuffer = '';
+        this.inThinkingBlock = false;
+        this.thinkingExtracted = false;
+        this.thinkingBlockIndex = null;
+        this.textBlockIndex = null;
+        this.nextBlockIndex = 0;
+        this.thinkingContent = '';
+    }
+
+    /**
+     * 获取下一个块索引
+     */
+    getNextBlockIndex() {
+        return this.nextBlockIndex++;
+    }
+
+    /**
+     * 处理包含 thinking 块的内容
+     * @param {string} content - 要处理的内容
+     * @returns {Array} 事件数组
+     */
+    processContentWithThinking(content) {
+        const events = [];
+
+        // 将内容添加到缓冲区进行处理
+        this.thinkingBuffer += content;
+
+        while (true) {
+            if (!this.inThinkingBlock && !this.thinkingExtracted) {
+                // 查找 <thinking> 开始标签
+                const startPos = findRealThinkingStartTag(this.thinkingBuffer);
+                if (startPos !== null) {
+                    // 发送 <thinking> 之前的内容作为 text_delta
+                    const beforeThinking = this.thinkingBuffer.substring(0, startPos);
+                    if (beforeThinking) {
+                        events.push(...this.createTextDeltaEvents(beforeThinking));
+                    }
+
+                    // 进入 thinking 块
+                    this.inThinkingBlock = true;
+                    this.thinkingBuffer = this.thinkingBuffer.substring(startPos + '<thinking>'.length);
+
+                    // 创建 thinking 块的 content_block_start 事件
+                    this.thinkingBlockIndex = this.getNextBlockIndex();
+                    events.push({
+                        type: 'content_block_start',
+                        index: this.thinkingBlockIndex,
+                        content_block: {
+                            type: 'thinking',
+                            thinking: ''
+                        }
+                    });
+                } else {
+                    // 没有找到 <thinking>，检查是否可能是部分标签
+                    const targetLen = Math.max(0, this.thinkingBuffer.length - '<thinking>'.length);
+                    if (targetLen > 0) {
+                        const safeContent = this.thinkingBuffer.substring(0, targetLen);
+                        if (safeContent) {
+                            events.push(...this.createTextDeltaEvents(safeContent));
+                        }
+                        this.thinkingBuffer = this.thinkingBuffer.substring(targetLen);
+                    }
+                    break;
+                }
+            } else if (this.inThinkingBlock) {
+                // 在 thinking 块内，查找 </thinking> 结束标签
+                const endPos = findRealThinkingEndTag(this.thinkingBuffer);
+                if (endPos !== null) {
+                    // 提取 thinking 内容
+                    const thinkingContent = this.thinkingBuffer.substring(0, endPos);
+                    if (thinkingContent) {
+                        this.thinkingContent += thinkingContent;
+                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
+                    }
+
+                    // 结束 thinking 块
+                    this.inThinkingBlock = false;
+                    this.thinkingExtracted = true;
+
+                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+                    events.push({
+                        type: 'content_block_stop',
+                        index: this.thinkingBlockIndex
+                    });
+
+                    this.thinkingBuffer = this.thinkingBuffer.substring(endPos + '</thinking>'.length);
+                } else {
+                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta
+                    const targetLen = Math.max(0, this.thinkingBuffer.length - '</thinking>'.length);
+                    if (targetLen > 0) {
+                        const safeContent = this.thinkingBuffer.substring(0, targetLen);
+                        if (safeContent) {
+                            this.thinkingContent += safeContent;
+                            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, safeContent));
+                        }
+                        this.thinkingBuffer = this.thinkingBuffer.substring(targetLen);
+                    }
+                    break;
+                }
+            } else {
+                // thinking 已提取完成，剩余内容作为 text_delta
+                if (this.thinkingBuffer) {
+                    const remaining = this.thinkingBuffer;
+                    this.thinkingBuffer = '';
+                    events.push(...this.createTextDeltaEvents(remaining));
+                }
+                break;
+            }
+        }
+
+        return events;
+    }
+
+    /**
+     * 创建 text_delta 事件
+     */
+    createTextDeltaEvents(text) {
+        const events = [];
+
+        // 如果文本块尚未创建，需要先创建
+        if (this.textBlockIndex === null) {
+            this.textBlockIndex = this.getNextBlockIndex();
+            events.push({
+                type: 'content_block_start',
+                index: this.textBlockIndex,
+                content_block: {
+                    type: 'text',
+                    text: ''
+                }
+            });
+        }
+
+        events.push({
+            type: 'content_block_delta',
+            index: this.textBlockIndex,
+            delta: {
+                type: 'text_delta',
+                text: text
+            }
+        });
+
+        return events;
+    }
+
+    /**
+     * 创建 thinking_delta 事件
+     */
+    createThinkingDeltaEvent(index, thinking) {
+        return {
+            type: 'content_block_delta',
+            index: index,
+            delta: {
+                type: 'thinking_delta',
+                thinking: thinking
+            }
+        };
+    }
+
+    /**
+     * 处理 tool_use 前的 thinking 结束
+     * 当 tool_use 紧跟 thinking 时，需要先关闭 thinking 块
+     */
+    handleToolUseStart() {
+        const events = [];
+
+        if (this.thinkingEnabled && this.inThinkingBlock) {
+            const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
+            if (endPos !== null) {
+                const thinkingContent = this.thinkingBuffer.substring(0, endPos);
+                if (thinkingContent) {
+                    this.thinkingContent += thinkingContent;
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
+                }
+
+                // 结束 thinking 块
+                this.inThinkingBlock = false;
+                this.thinkingExtracted = true;
+
+                events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+                events.push({
+                    type: 'content_block_stop',
+                    index: this.thinkingBlockIndex
+                });
+
+                const afterPos = endPos + '</thinking>'.length;
+                const remaining = this.thinkingBuffer.substring(afterPos);
+                this.thinkingBuffer = '';
+                if (remaining.trim()) {
+                    events.push(...this.createTextDeltaEvents(remaining));
+                }
+            }
+        }
+
+        // 如果有待输出的文本，先 flush
+        if (this.thinkingEnabled && !this.inThinkingBlock && !this.thinkingExtracted && this.thinkingBuffer) {
+            const buffered = this.thinkingBuffer;
+            this.thinkingBuffer = '';
+            events.push(...this.createTextDeltaEvents(buffered));
+        }
+
+        return events;
+    }
+
+    /**
+     * 生成最终事件（flush 剩余内容）
+     */
+    generateFinalEvents() {
+        const events = [];
+
+        if (this.thinkingEnabled && this.thinkingBuffer) {
+            if (this.inThinkingBlock) {
+                // 末尾可能残留 </thinking>
+                const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
+                if (endPos !== null) {
+                    const thinkingContent = this.thinkingBuffer.substring(0, endPos);
+                    if (thinkingContent) {
+                        this.thinkingContent += thinkingContent;
+                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
+                    }
+
+                    // 关闭 thinking 块
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+                    events.push({
+                        type: 'content_block_stop',
+                        index: this.thinkingBlockIndex
+                    });
+
+                    const afterPos = endPos + '</thinking>'.length;
+                    const remaining = this.thinkingBuffer.substring(afterPos);
+                    this.thinkingBuffer = '';
+                    this.inThinkingBlock = false;
+                    this.thinkingExtracted = true;
+                    if (remaining.trim()) {
+                        events.push(...this.createTextDeltaEvents(remaining));
+                    }
+                } else {
+                    // 发送剩余内容作为 thinking_delta
+                    this.thinkingContent += this.thinkingBuffer;
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, this.thinkingBuffer));
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+                    events.push({
+                        type: 'content_block_stop',
+                        index: this.thinkingBlockIndex
+                    });
+                }
+            } else {
+                // 发送剩余内容作为 text_delta
+                events.push(...this.createTextDeltaEvents(this.thinkingBuffer));
+            }
+            this.thinkingBuffer = '';
+        }
+
+        // 关闭文本块
+        if (this.textBlockIndex !== null) {
+            events.push({
+                type: 'content_block_stop',
+                index: this.textBlockIndex
+            });
+        }
+
+        return events;
+    }
+}
+
+/**
+ * 从响应文本中提取 thinking 内容（非流式模式）
+ * @param {string} text - 响应文本
+ * @returns {{ thinking: string|null, content: string }} 提取的 thinking 和剩余内容
+ */
+function extractThinkingFromText(text) {
+    let thinking = null;
+    let content = text;
+
+    const startPos = findRealThinkingStartTag(text);
+    if (startPos !== null) {
+        // 找到开始标签，查找结束标签
+        const afterStart = text.substring(startPos + '<thinking>'.length);
+        
+        // 在剩余文本中查找结束标签
+        let endPos = null;
+        let searchStart = 0;
+        const TAG = '</thinking>';
+        
+        while (true) {
+            const pos = afterStart.indexOf(TAG, searchStart);
+            if (pos === -1) break;
+            
+            // 检查是否被引用字符包裹
+            const hasQuoteBefore = pos > 0 && isQuoteChar(afterStart, pos - 1);
+            const afterPos = pos + TAG.length;
+            const hasQuoteAfter = isQuoteChar(afterStart, afterPos);
+            
+            if (!hasQuoteBefore && !hasQuoteAfter) {
+                endPos = pos;
+                break;
+            }
+            searchStart = pos + 1;
+        }
+        
+        if (endPos !== null) {
+            thinking = afterStart.substring(0, endPos);
+            // 内容是开始标签之前的部分 + 结束标签之后的部分
+            const beforeThinking = text.substring(0, startPos);
+            const afterThinking = afterStart.substring(endPos + TAG.length);
+            content = (beforeThinking + afterThinking).trim();
+            
+            // 移除开头的双换行符（thinking 结束标签后通常有 \n\n）
+            if (content.startsWith('\n\n')) {
+                content = content.substring(2);
+            }
+        }
+    }
+
+    return { thinking, content };
+}
+
 /**
  * 通用的括号匹配函数 - 支持多种括号类型
  * @param {string} text - 要搜索的文本
@@ -572,11 +1020,29 @@ export class KiroApiService {
 
     /**
      * Build CodeWhisperer request from OpenAI messages
+     * @param {Array} messages - 消息数组
+     * @param {string} model - 模型名称
+     * @param {Array} tools - 工具定义数组
+     * @param {string|Array} inSystemPrompt - 系统提示
+     * @param {Object} thinking - thinking 配置 { type: 'enabled', budget_tokens: number }
      */
-    buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null) {
+    buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
         const conversationId = uuidv4();
 
         let systemPrompt = this.getContentText(inSystemPrompt);
+        
+        // 如果启用了 thinking，在系统提示前注入 thinking 标签
+        if (thinking?.type === 'enabled') {
+            const budgetTokens = Math.min(thinking.budget_tokens || 20000, 24576); // 默认 20000，最大 24576
+            const thinkingPrefix = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budgetTokens}</max_thinking_length>`;
+            
+            // 检查系统提示是否已包含 thinking 标签
+            if (!systemPrompt.includes('<thinking_mode>') && !systemPrompt.includes('<max_thinking_length>')) {
+                systemPrompt = systemPrompt ? `${thinkingPrefix}\n${systemPrompt}` : thinkingPrefix;
+                console.log(`[Kiro] Injected thinking tags with budget_tokens: ${budgetTokens}`);
+            }
+        }
+        
         const processedMessages = messages;
 
         if (processedMessages.length === 0) {
@@ -1039,7 +1505,7 @@ export class KiroApiService {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
 
-        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system);
+        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -1152,7 +1618,10 @@ export class KiroApiService {
         }
 
         const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
-        console.log(`[Kiro] Calling generateContent with model: ${finalModel}`);
+        
+        // 检查是否启用 thinking
+        const thinkingEnabled = requestBody.thinking?.type === 'enabled';
+        console.log(`[Kiro] Calling generateContent with model: ${finalModel} (thinking: ${thinkingEnabled})`);
 
         const response = await this.callApi('', finalModel, requestBody);
 
@@ -1170,7 +1639,16 @@ export class KiroApiService {
                 inputTokens = this.calculateInputTokensFromPercentage(percentage);
             }
 
-            return this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            // 如果启用了 thinking，从响应文本中提取 thinking 内容
+            let thinking = null;
+            let finalContent = responseText;
+            if (thinkingEnabled) {
+                const extracted = extractThinkingFromText(responseText);
+                thinking = extracted.thinking;
+                finalContent = extracted.content;
+            }
+
+            return this.buildClaudeResponse(finalContent, false, 'assistant', model, toolCalls, inputTokens, thinking);
         } catch (error) {
             console.error('[Kiro] Error in generateContent:', error);
             throw new Error(`Error processing response: ${error.message}`);
@@ -1330,7 +1808,7 @@ export class KiroApiService {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
-        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system);
+        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
 
         const token = this.accessToken;
         const headers = {
@@ -1457,7 +1935,10 @@ export class KiroApiService {
         }
 
         const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
-        console.log(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
+        
+        // 检查是否启用 thinking（从 requestBody 中获取）
+        const thinkingEnabled = requestBody.thinking?.type === 'enabled';
+        console.log(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming, thinking: ${thinkingEnabled})`);
 
         let inputTokens = 0;
         let contextUsagePercentage = null;
@@ -1465,12 +1946,16 @@ export class KiroApiService {
 
         let messageStartSent = false;
         const bufferedEvents = [];
+        
+        // 创建 thinking 流处理上下文
+        const thinkingContext = new ThinkingStreamContext(thinkingEnabled);
 
         try {
             let totalContent = '';
             let outputTokens = 0;
             const toolCalls = [];
             let currentToolCall = null;
+            let nextBlockIndex = 0; // 用于非 thinking 模式的块索引
 
             for await (const event of this.streamApiReal('', finalModel, requestBody)) {
                 if (event.type === 'contextUsage' && event.percentage) {
@@ -1495,11 +1980,15 @@ export class KiroApiService {
                             }
                         };
 
-                        yield {
-                            type: "content_block_start",
-                            index: 0,
-                            content_block: { type: "text", text: "" }
-                        };
+                        // 如果未启用 thinking，创建初始文本块
+                        if (!thinkingEnabled) {
+                            yield {
+                                type: "content_block_start",
+                                index: 0,
+                                content_block: { type: "text", text: "" }
+                            };
+                            nextBlockIndex = 1;
+                        }
 
                         messageStartSent = true;
 
@@ -1511,18 +2000,39 @@ export class KiroApiService {
                 } else if (event.type === 'content' && event.content) {
                     totalContent += event.content;
 
-                    const contentEvent = {
-                        type: "content_block_delta",
-                        index: 0,
-                        delta: { type: "text_delta", text: event.content }
-                    };
-
-                    if (messageStartSent) {
-                        yield contentEvent;
+                    if (thinkingEnabled) {
+                        // 使用 thinking 上下文处理内容
+                        const thinkingEvents = thinkingContext.processContentWithThinking(event.content);
+                        for (const te of thinkingEvents) {
+                            if (messageStartSent) {
+                                yield te;
+                            } else {
+                                bufferedEvents.push(te);
+                            }
+                        }
                     } else {
-                        bufferedEvents.push(contentEvent);
+                        // 非 thinking 模式，直接发送 text_delta
+                        const contentEvent = {
+                            type: "content_block_delta",
+                            index: 0,
+                            delta: { type: "text_delta", text: event.content }
+                        };
+
+                        if (messageStartSent) {
+                            yield contentEvent;
+                        } else {
+                            bufferedEvents.push(contentEvent);
+                        }
                     }
                 } else if (event.type === 'toolUse') {
+                    // 处理 tool_use 前的 thinking 结束
+                    if (thinkingEnabled) {
+                        const toolUseStartEvents = thinkingContext.handleToolUseStart();
+                        for (const te of toolUseStartEvents) {
+                            yield te;
+                        }
+                    }
+
                     const tc = event.toolUse;
                     // 工具调用事件（包含 name 和 toolUseId）
                     if (tc.name && tc.toolUseId) {
@@ -1603,14 +2113,23 @@ export class KiroApiService {
                 }
             }
 
-            // 4. 发送 content_block_stop 事件
-            yield { type: "content_block_stop", index: 0 };
+            // 生成最终事件（flush thinking 缓冲区）
+            if (thinkingEnabled) {
+                const finalThinkingEvents = thinkingContext.generateFinalEvents();
+                for (const te of finalThinkingEvents) {
+                    yield te;
+                }
+                nextBlockIndex = thinkingContext.nextBlockIndex;
+            } else {
+                // 非 thinking 模式，发送 content_block_stop 事件
+                yield { type: "content_block_stop", index: 0 };
+            }
 
-            // 5. 处理工具调用（如果有）
+            // 处理工具调用（如果有）
             if (toolCalls.length > 0) {
                 for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
-                    const blockIndex = i + 1;
+                    const blockIndex = thinkingEnabled ? thinkingContext.nextBlockIndex + i : i + 1;
 
                     yield {
                         type: "content_block_start",
@@ -1636,9 +2155,11 @@ export class KiroApiService {
                 }
             }
 
-            // 6. 发送 message_delta 事件
-            // 在流结束后统一计算 output tokens，避免在流式循环中阻塞事件循环
+            // 计算 output tokens
             outputTokens = this.countTextTokens(totalContent);
+            if (thinkingEnabled && thinkingContext.thinkingContent) {
+                outputTokens += this.countTextTokens(thinkingContext.thinkingContent);
+            }
             for (const tc of toolCalls) {
                 outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
             }
@@ -1657,7 +2178,7 @@ export class KiroApiService {
                 }
             };
 
-            // 7. 发送 message_stop 事件
+            // 发送 message_stop 事件
             yield { type: "message_stop" };
 
         } catch (error) {
@@ -1730,8 +2251,15 @@ export class KiroApiService {
 
     /**
      * Build Claude compatible response object
+     * @param {string} content - 文本内容
+     * @param {boolean} isStream - 是否流式响应
+     * @param {string} role - 角色
+     * @param {string} model - 模型名称
+     * @param {Array} toolCalls - 工具调用数组
+     * @param {number} inputTokens - 输入 token 数
+     * @param {string|null} thinking - thinking 内容（可选）
      */
-    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0) {
+    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0, thinking = null) {
         const messageId = `${uuidv4()}`;
 
         if (isStream) {
@@ -1757,35 +2285,63 @@ export class KiroApiService {
 
             let totalOutputTokens = 0;
             let stopReason = "end_turn";
+            let currentBlockIndex = 0;
 
-            if (content) {
-                // If there are tool calls AND content, the content block index should be after tool calls
-                const contentBlockIndex = (toolCalls && toolCalls.length > 0) ? toolCalls.length : 0;
-
-                // 2. content_block_start for text
+            // 处理 thinking 块（如果有）
+            if (thinking) {
+                // content_block_start for thinking
                 events.push({
                     type: "content_block_start",
-                    index: contentBlockIndex,
+                    index: currentBlockIndex,
+                    content_block: {
+                        type: "thinking",
+                        thinking: ""
+                    }
+                });
+                // content_block_delta for thinking
+                events.push({
+                    type: "content_block_delta",
+                    index: currentBlockIndex,
+                    delta: {
+                        type: "thinking_delta",
+                        thinking: thinking
+                    }
+                });
+                // content_block_stop for thinking
+                events.push({
+                    type: "content_block_stop",
+                    index: currentBlockIndex
+                });
+                totalOutputTokens += this.countTextTokens(thinking);
+                currentBlockIndex++;
+            }
+
+            if (content) {
+                // content_block_start for text
+                events.push({
+                    type: "content_block_start",
+                    index: currentBlockIndex,
                     content_block: {
                         type: "text",
                         text: "" // Initial empty text
                     }
                 });
-                // 3. content_block_delta for text
+                // content_block_delta for text
                 events.push({
                     type: "content_block_delta",
-                    index: contentBlockIndex,
+                    index: currentBlockIndex,
                     delta: {
                         type: "text_delta",
                         text: content
                     }
                 });
-                // 4. content_block_stop
+                // content_block_stop
                 events.push({
                     type: "content_block_stop",
-                    index: contentBlockIndex
+                    index: currentBlockIndex
                 });
                 totalOutputTokens += this.countTextTokens(content);
+                currentBlockIndex++;
                 // If there are tool calls, the stop reason remains "tool_use".
                 // If only content, it's "end_turn".
                 if (!toolCalls || toolCalls.length === 0) {
@@ -1794,7 +2350,7 @@ export class KiroApiService {
             }
 
             if (toolCalls && toolCalls.length > 0) {
-                toolCalls.forEach((tc, index) => {
+                toolCalls.forEach((tc) => {
                     let inputObject;
                     try {
                         // Arguments should be a stringified JSON object, need to parse it
@@ -1806,10 +2362,10 @@ export class KiroApiService {
                         // since Claude's `input` field expects an object.
                         inputObject = { "raw_arguments": tc.function.arguments };
                     }
-                    // 2. content_block_start for each tool_use
+                    // content_block_start for each tool_use
                     events.push({
                         type: "content_block_start",
-                        index: index,
+                        index: currentBlockIndex,
                         content_block: {
                             type: "tool_use",
                             id: tc.id,
@@ -1818,28 +2374,29 @@ export class KiroApiService {
                         }
                     });
 
-                    // 3. content_block_delta for each tool_use
+                    // content_block_delta for each tool_use
                     // Since Kiro is not truly streaming, we send the full arguments as one delta.
                     events.push({
                         type: "content_block_delta",
-                        index: index,
+                        index: currentBlockIndex,
                         delta: {
                             type: "input_json_delta",
                             partial_json: JSON.stringify(inputObject)
                         }
                     });
 
-                    // 4. content_block_stop for each tool_use
+                    // content_block_stop for each tool_use
                     events.push({
                         type: "content_block_stop",
-                        index: index
+                        index: currentBlockIndex
                     });
                     totalOutputTokens += this.countTextTokens(JSON.stringify(inputObject));
+                    currentBlockIndex++;
                 });
                 stopReason = "tool_use"; // If there are tool calls, the stop reason is tool_use
             }
 
-            // 5. message_delta with appropriate stop reason
+            // message_delta with appropriate stop reason
             events.push({
                 type: "message_delta",
                 delta: {
@@ -1849,7 +2406,7 @@ export class KiroApiService {
                 usage: { output_tokens: totalOutputTokens }
             });
 
-            // 6. message_stop event
+            // message_stop event
             events.push({
                 type: "message_stop"
             });
@@ -1860,6 +2417,15 @@ export class KiroApiService {
             const contentArray = [];
             let stopReason = "end_turn";
             let outputTokens = 0;
+
+            // 添加 thinking 块（如果有）
+            if (thinking) {
+                contentArray.push({
+                    type: "thinking",
+                    thinking: thinking
+                });
+                outputTokens += this.countTextTokens(thinking);
+            }
 
             if (toolCalls && toolCalls.length > 0) {
                 for (const tc of toolCalls) {
@@ -1883,7 +2449,10 @@ export class KiroApiService {
                     outputTokens += this.countTextTokens(tc.function.arguments);
                 }
                 stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
-            } else if (content) {
+            }
+            
+            // 添加文本内容（在 tool_use 之后）
+            if (content) {
                 contentArray.push({
                     type: "text",
                     text: content
