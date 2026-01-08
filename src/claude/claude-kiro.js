@@ -2017,10 +2017,10 @@ export class KiroApiService {
                 currentToolCall = null;
             }
 
-            // Fallback: 如果 contextUsagePercentage 没有收到，抛出错误
-            if (!messageStartSent) {
-                console.error('[Kiro Stream] contextUsagePercentage not received from API - cannot calculate accurate input tokens');
-                throw new Error('Failed to receive contextUsagePercentage from Kiro API. Input token calculation requires this data.');
+            // 如果 contextUsagePercentage 没有收到，使用估算值
+            if (contextUsagePercentage === null) {
+                console.warn('[Kiro Stream] contextUsagePercentage not received, using estimated input tokens');
+                inputTokens = this.countTextTokens(totalContent);  // 简单估算
             }
 
             // 检查文本内容中的 bracket 格式工具调用
