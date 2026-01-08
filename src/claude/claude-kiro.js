@@ -138,7 +138,7 @@ function findRealThinkingStartTag(buffer) {
 }
 
 /**
- * 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
+ * 查找真正的 thinking 结束标签
  * @param {string} buffer - 要搜索的字符串
  * @returns {number|null} 结束标签的位置，未找到返回 null
  */
@@ -162,21 +162,8 @@ function findRealThinkingEndTag(buffer) {
             continue;
         }
 
-        // 检查后面的内容
-        const afterContent = buffer.substring(afterPos);
-
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if (afterContent.length < 2) {
-            return null;
-        }
-
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if (afterContent.startsWith('\n\n')) {
-            return pos;
-        }
-
-        // 不是双换行符，跳过继续搜索
-        searchStart = pos + 1;
+        // 找到有效的结束标签
+        return pos;
     }
 }
 
