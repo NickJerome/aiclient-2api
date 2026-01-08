@@ -220,9 +220,8 @@ function findRealThinkingEndTagAtBufferEnd(buffer) {
 class ThinkingStreamContext {
     constructor(thinkingEnabled = false) {
         this.thinkingEnabled = thinkingEnabled;
-        this.thinkingBuffer = '';
-        this.inThinkingBlock = false;
-        this.thinkingExtracted = false;
+        this.hasThinkingTag = false;  // 是否检测到 <thinking> 标签
+        this.inThinkingBlock = false;  // 是否在 thinking 块内
         this.thinkingBlockIndex = null;
         this.textBlockIndex = null;
         this.nextBlockIndex = 0;
@@ -244,23 +243,40 @@ class ThinkingStreamContext {
     processContentWithThinking(content) {
         const events = [];
 
-        // 将内容添加到缓冲区进行处理
-        this.thinkingBuffer += content;
+        // 如果未启用 thinking，直接作为文本输出
+        if (!this.thinkingEnabled) {
+            return this.createTextDeltaEvents(content);
+        }
 
-        while (true) {
-            if (!this.inThinkingBlock && !this.thinkingExtracted) {
+        // 首次检测：检查是否包含 <thinking> 标签
+        if (!this.hasThinkingTag && !this.inThinkingBlock) {
+            if (content.includes('<thinking>')) {
+                this.hasThinkingTag = true;
+            }
+        }
+
+        // 如果确定没有 thinking 标签，直接作为普通文本输出
+        if (!this.hasThinkingTag) {
+            return this.createTextDeltaEvents(content);
+        }
+
+        // 有 thinking 标签，进行处理
+        let remainingContent = content;
+
+        while (remainingContent.length > 0) {
+            if (!this.inThinkingBlock) {
                 // 查找 <thinking> 开始标签
-                const startPos = findRealThinkingStartTag(this.thinkingBuffer);
+                const startPos = findRealThinkingStartTag(remainingContent);
                 if (startPos !== null) {
                     // 发送 <thinking> 之前的内容作为 text_delta
-                    const beforeThinking = this.thinkingBuffer.substring(0, startPos);
+                    const beforeThinking = remainingContent.substring(0, startPos);
                     if (beforeThinking) {
                         events.push(...this.createTextDeltaEvents(beforeThinking));
                     }
 
                     // 进入 thinking 块
                     this.inThinkingBlock = true;
-                    this.thinkingBuffer = this.thinkingBuffer.substring(startPos + '<thinking>'.length);
+                    remainingContent = remainingContent.substring(startPos + '<thinking>'.length);
 
                     // 创建 thinking 块的 content_block_start 事件
                     this.thinkingBlockIndex = this.getNextBlockIndex();
@@ -273,23 +289,18 @@ class ThinkingStreamContext {
                         }
                     });
                 } else {
-                    // 没有找到 <thinking>，检查是否可能是部分标签
-                    const targetLen = Math.max(0, this.thinkingBuffer.length - '<thinking>'.length);
-                    if (targetLen > 0) {
-                        const safeContent = this.thinkingBuffer.substring(0, targetLen);
-                        if (safeContent) {
-                            events.push(...this.createTextDeltaEvents(safeContent));
-                        }
-                        this.thinkingBuffer = this.thinkingBuffer.substring(targetLen);
+                    // 没有找到 <thinking> 标签，全部作为文本输出
+                    if (remainingContent) {
+                        events.push(...this.createTextDeltaEvents(remainingContent));
                     }
                     break;
                 }
-            } else if (this.inThinkingBlock) {
+            } else {
                 // 在 thinking 块内，查找 </thinking> 结束标签
-                const endPos = findRealThinkingEndTag(this.thinkingBuffer);
+                const endPos = findRealThinkingEndTag(remainingContent);
                 if (endPos !== null) {
                     // 提取 thinking 内容
-                    const thinkingContent = this.thinkingBuffer.substring(0, endPos);
+                    const thinkingContent = remainingContent.substring(0, endPos);
                     if (thinkingContent) {
                         this.thinkingContent += thinkingContent;
                         events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
@@ -297,7 +308,6 @@ class ThinkingStreamContext {
 
                     // 结束 thinking 块
                     this.inThinkingBlock = false;
-                    this.thinkingExtracted = true;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
@@ -306,28 +316,16 @@ class ThinkingStreamContext {
                         index: this.thinkingBlockIndex
                     });
 
-                    this.thinkingBuffer = this.thinkingBuffer.substring(endPos + '</thinking>'.length);
+                    remainingContent = remainingContent.substring(endPos + '</thinking>'.length);
                 } else {
-                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta
-                    const targetLen = Math.max(0, this.thinkingBuffer.length - '</thinking>'.length);
-                    if (targetLen > 0) {
-                        const safeContent = this.thinkingBuffer.substring(0, targetLen);
-                        if (safeContent) {
-                            this.thinkingContent += safeContent;
-                            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, safeContent));
-                        }
-                        this.thinkingBuffer = this.thinkingBuffer.substring(targetLen);
+                    // 没有找到结束标签，发送当前全部内容作为 thinking_delta
+                    if (remainingContent) {
+                        this.thinkingContent += remainingContent;
+                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, remainingContent));
                     }
+                    remainingContent = '';
                     break;
                 }
-            } else {
-                // thinking 已提取完成，剩余内容作为 text_delta
-                if (this.thinkingBuffer) {
-                    const remaining = this.thinkingBuffer;
-                    this.thinkingBuffer = '';
-                    events.push(...this.createTextDeltaEvents(remaining));
-                }
-                break;
             }
         }
 
@@ -382,98 +380,46 @@ class ThinkingStreamContext {
     /**
      * 处理 tool_use 前的 thinking 结束
      * 当 tool_use 紧跟 thinking 时，需要先关闭 thinking 块
+     * 注意：由于不再使用缓冲区，这个方法现在主要用于处理
+     * 思考块没有正确结束的边缘情况
      */
     handleToolUseStart() {
         const events = [];
 
+        // 如果在 thinking 块内，需要先关闭它
         if (this.thinkingEnabled && this.inThinkingBlock) {
-            const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
-            if (endPos !== null) {
-                const thinkingContent = this.thinkingBuffer.substring(0, endPos);
-                if (thinkingContent) {
-                    this.thinkingContent += thinkingContent;
-                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
-                }
+            // 关闭 thinking 块
+            this.inThinkingBlock = false;
 
-                // 结束 thinking 块
-                this.inThinkingBlock = false;
-                this.thinkingExtracted = true;
-
-                events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-                events.push({
-                    type: 'content_block_stop',
-                    index: this.thinkingBlockIndex
-                });
-
-                const afterPos = endPos + '</thinking>'.length;
-                const remaining = this.thinkingBuffer.substring(afterPos);
-                this.thinkingBuffer = '';
-                if (remaining.trim()) {
-                    events.push(...this.createTextDeltaEvents(remaining));
-                }
-            }
-        }
-
-        // 如果有待输出的文本，先 flush
-        if (this.thinkingEnabled && !this.inThinkingBlock && !this.thinkingExtracted && this.thinkingBuffer) {
-            const buffered = this.thinkingBuffer;
-            this.thinkingBuffer = '';
-            events.push(...this.createTextDeltaEvents(buffered));
+            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+            events.push({
+                type: 'content_block_stop',
+                index: this.thinkingBlockIndex
+            });
         }
 
         return events;
     }
 
     /**
-     * 生成最终事件（flush 剩余内容）
+     * 生成最终事件（关闭未完成的块）
      */
     generateFinalEvents() {
         const events = [];
 
-        if (this.thinkingEnabled && this.thinkingBuffer) {
-            if (this.inThinkingBlock) {
-                // 末尾可能残留 </thinking>
-                const endPos = findRealThinkingEndTagAtBufferEnd(this.thinkingBuffer);
-                if (endPos !== null) {
-                    const thinkingContent = this.thinkingBuffer.substring(0, endPos);
-                    if (thinkingContent) {
-                        this.thinkingContent += thinkingContent;
-                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
-                    }
+        // 如果在 thinking 块内，需要关闭它
+        if (this.thinkingEnabled && this.inThinkingBlock) {
+            // 关闭 thinking 块
+            this.inThinkingBlock = false;
 
-                    // 关闭 thinking 块
-                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-                    events.push({
-                        type: 'content_block_stop',
-                        index: this.thinkingBlockIndex
-                    });
-
-                    const afterPos = endPos + '</thinking>'.length;
-                    const remaining = this.thinkingBuffer.substring(afterPos);
-                    this.thinkingBuffer = '';
-                    this.inThinkingBlock = false;
-                    this.thinkingExtracted = true;
-                    if (remaining.trim()) {
-                        events.push(...this.createTextDeltaEvents(remaining));
-                    }
-                } else {
-                    // 发送剩余内容作为 thinking_delta
-                    this.thinkingContent += this.thinkingBuffer;
-                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, this.thinkingBuffer));
-                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-                    events.push({
-                        type: 'content_block_stop',
-                        index: this.thinkingBlockIndex
-                    });
-                }
-            } else {
-                // 发送剩余内容作为 text_delta
-                events.push(...this.createTextDeltaEvents(this.thinkingBuffer));
-            }
-            this.thinkingBuffer = '';
+            events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+            events.push({
+                type: 'content_block_stop',
+                index: this.thinkingBlockIndex
+            });
         }
 
-        // 关闭文本块
+        // 关闭文本块（如果有）
         if (this.textBlockIndex !== null) {
             events.push({
                 type: 'content_block_stop',
