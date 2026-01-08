@@ -4,8 +4,7 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'VERSION'  # 仅当 VERSION 文件变更时触发
+  workflow_dispatch:  # 允许手动触发
 
 env:
   REGISTRY: ghcr.io
