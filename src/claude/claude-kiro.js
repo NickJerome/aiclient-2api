@@ -235,9 +235,9 @@ class ThinkingStreamContext {
             return this.createTextDeltaEvents(content);
         }
 
-        // 首次检测：检查是否包含 <thinking> 标签
+        // 首次检测：使用 findRealThinkingStartTag 检查是否有真正的 <thinking> 标签
         if (!this.hasThinkingTag && !this.inThinkingBlock) {
-            if (content.includes('<thinking>')) {
+            if (findRealThinkingStartTag(content) !== null) {
                 this.hasThinkingTag = true;
             }
         }
