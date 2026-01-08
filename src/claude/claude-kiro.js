@@ -1886,15 +1886,35 @@ export class KiroApiService {
         const thinkingEnabled = requestBody.thinking?.type === 'enabled';
         console.log(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming, thinking: ${thinkingEnabled})`);
 
-        let inputTokens = 0;
         let contextUsagePercentage = null;
         const messageId = `${uuidv4()}`;
 
         let messageStartSent = false;
-        const bufferedEvents = [];
+        let inputTokens = 0;  // 保存从 contextUsage 获取的 input_tokens
         
         // 创建 thinking 流处理上下文
         const thinkingContext = new ThinkingStreamContext(thinkingEnabled);
+
+        // 辅助函数：发送 message_start 事件
+        function* sendMessageStart() {
+            yield {
+                type: "message_start",
+                message: {
+                    id: messageId,
+                    type: "message",
+                    role: "assistant",
+                    model: model,
+                    usage: {
+                        input_tokens: inputTokens,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0
+                    },
+                    content: []
+                }
+            };
+            messageStartSent = true;
+        }
 
         try {
             let totalContent = '';
@@ -1907,24 +1927,12 @@ export class KiroApiService {
                 if (event.type === 'contextUsage' && event.percentage) {
                     contextUsagePercentage = event.percentage;
                     inputTokens = this.calculateInputTokensFromPercentage(contextUsagePercentage);
+                } else if (event.type === 'content' && event.content) {
+                    totalContent += event.content;
 
+                    // 如果还未发送 message_start，立即发送
                     if (!messageStartSent) {
-                        yield {
-                            type: "message_start",
-                            message: {
-                                id: messageId,
-                                type: "message",
-                                role: "assistant",
-                                model: model,
-                                usage: {
-                                    input_tokens: inputTokens,
-                                    output_tokens: 0,
-                                    cache_creation_input_tokens: 0,
-                                    cache_read_input_tokens: 0
-                                },
-                                content: []
-                            }
-                        };
+                        yield* sendMessageStart();
 
                         // 如果未启用 thinking，创建初始文本块
                         if (!thinkingEnabled) {
@@ -1935,40 +1943,21 @@ export class KiroApiService {
                             };
                             nextBlockIndex = 1;
                         }
-
-                        messageStartSent = true;
-
-                        for (const buffered of bufferedEvents) {
-                            yield buffered;
-                        }
-                        bufferedEvents.length = 0;
                     }
-                } else if (event.type === 'content' && event.content) {
-                    totalContent += event.content;
 
                     if (thinkingEnabled) {
-                        // 使用 thinking 上下文处理内容
+                        // 使用 thinking 上下文处理内容，直接 yield 不缓冲
                         const thinkingEvents = thinkingContext.processContentWithThinking(event.content);
                         for (const te of thinkingEvents) {
-                            if (messageStartSent) {
-                                yield te;
-                            } else {
-                                bufferedEvents.push(te);
-                            }
+                            yield te;
                         }
                     } else {
                         // 非 thinking 模式，直接发送 text_delta
-                        const contentEvent = {
+                        yield {
                             type: "content_block_delta",
                             index: 0,
                             delta: { type: "text_delta", text: event.content }
                         };
-
-                        if (messageStartSent) {
-                            yield contentEvent;
-                        } else {
-                            bufferedEvents.push(contentEvent);
-                        }
                     }
                 } else if (event.type === 'toolUse') {
                     // 处理 tool_use 前的 thinking 结束
