@@ -89,115 +89,84 @@ function getSystemRuntimeInfo() {
 
 // Helper functions for tool calls and JSON parsing
 
-// ==================== Thinking 标签解析函数 ====================
+// ==================== Thinking 标签解析 ====================
+
+const THINKING_START_TAG = '<thinking>';
+const THINKING_END_TAG = '</thinking>';
 
 /**
- * 需要跳过的包裹字符
- * 当 thinking 标签被这些字符包裹时，认为是在引用标签而非真正的标签
+ * Thinking 标签状态机匹配器
+ * 只负责匹配标签，不缓存任何数据，只记录匹配位置
  */
-const QUOTE_CHARS = ['`', '"', "'", '\\', '#', '!', '@', '$', '%', '^', '&', '*', '(', ')', '-', '_', '=', '+', '[', ']', '{', '}', ';', ':', '<', '>', ',', '.', '?', '/'];
-
-/**
- * 检查指定位置的字符是否是引用字符
- * @param {string} buffer - 要检查的字符串
- * @param {number} pos - 位置
- * @returns {boolean}
- */
-function isQuoteChar(buffer, pos) {
-    if (pos < 0 || pos >= buffer.length) return false;
-    return QUOTE_CHARS.includes(buffer[pos]);
-}
-
-/**
- * 查找真正的 thinking 开始标签（不被引用字符包裹）
- * @param {string} buffer - 要搜索的字符串
- * @returns {number|null} 开始标签的位置，未找到返回 null
- */
-function findRealThinkingStartTag(buffer) {
-    const TAG = '<thinking>';
-    let searchStart = 0;
-
-    while (true) {
-        const pos = buffer.indexOf(TAG, searchStart);
-        if (pos === -1) return null;
-
-        // 检查前面是否有引用字符
-        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
-        // 检查后面是否有引用字符
-        const afterPos = pos + TAG.length;
-        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
-
-        // 如果不被引用字符包裹，则是真正的开始标签
-        if (!hasQuoteBefore && !hasQuoteAfter) {
-            return pos;
-        }
-
-        // 继续搜索下一个匹配
-        searchStart = pos + 1;
+class ThinkingTagMatcher {
+    constructor() {
+        this.startMatchPos = 0;  // 匹配 <thinking> 的位置
+        this.endMatchPos = 0;    // 匹配 </thinking> 的位置
+        this.inThinking = false; // 是否在 thinking 块内
     }
-}
 
-/**
- * 查找真正的 thinking 结束标签
- * @param {string} buffer - 要搜索的字符串
- * @returns {number|null} 结束标签的位置，未找到返回 null
- */
-function findRealThinkingEndTag(buffer) {
-    const TAG = '</thinking>';
-    let searchStart = 0;
-
-    while (true) {
-        const pos = buffer.indexOf(TAG, searchStart);
-        if (pos === -1) return null;
-
-        // 检查前面是否有引用字符
-        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
-        // 检查后面是否有引用字符
-        const afterPos = pos + TAG.length;
-        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
-
-        // 如果被引用字符包裹，跳过
-        if (hasQuoteBefore || hasQuoteAfter) {
-            searchStart = pos + 1;
-            continue;
+    /**
+     * 输入一个字符，推进状态机
+     * @param {string} char - 单个字符
+     * @returns {{ type: 'text'|'thinking', output: boolean, flush: number, event: 'start'|'end'|null }}
+     */
+    feed(char) {
+        if (!this.inThinking) {
+            // 尝试匹配 <thinking>
+            if (char === THINKING_START_TAG[this.startMatchPos]) {
+                this.startMatchPos++;
+                if (this.startMatchPos === THINKING_START_TAG.length) {
+                    // 完整匹配 <thinking>
+                    this.inThinking = true;
+                    this.startMatchPos = 0;
+                    return { type: 'text', output: false, flush: 0, event: 'start' };
+                }
+                return { type: 'text', output: false, flush: 0, event: null };
+            } else {
+                // 不匹配
+                const flush = this.startMatchPos;
+                this.startMatchPos = (char === THINKING_START_TAG[0]) ? 1 : 0;
+                return { type: 'text', output: this.startMatchPos === 0, flush, event: null };
+            }
+        } else {
+            // 尝试匹配 </thinking>
+            if (char === THINKING_END_TAG[this.endMatchPos]) {
+                this.endMatchPos++;
+                if (this.endMatchPos === THINKING_END_TAG.length) {
+                    // 完整匹配 </thinking>
+                    this.inThinking = false;
+                    this.endMatchPos = 0;
+                    return { type: 'thinking', output: false, flush: 0, event: 'end' };
+                }
+                return { type: 'thinking', output: false, flush: 0, event: null };
+            } else {
+                // 不匹配
+                const flush = this.endMatchPos;
+                this.endMatchPos = (char === THINKING_END_TAG[0]) ? 1 : 0;
+                return { type: 'thinking', output: this.endMatchPos === 0, flush, event: null };
+            }
         }
-
-        // 找到有效的结束标签
-        return pos;
     }
-}
 
-/**
- * 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
- * 用于"边界事件"场景：例如 thinking 结束后立刻进入 tool_use，或流结束
- * @param {string} buffer - 要搜索的字符串
- * @returns {number|null} 结束标签的位置，未找到返回 null
- */
-function findRealThinkingEndTagAtBufferEnd(buffer) {
-    const TAG = '</thinking>';
-    let searchStart = 0;
-
-    while (true) {
-        const pos = buffer.indexOf(TAG, searchStart);
-        if (pos === -1) return null;
-
-        // 检查前面是否有引用字符
-        const hasQuoteBefore = pos > 0 && isQuoteChar(buffer, pos - 1);
-        // 检查后面是否有引用字符
-        const afterPos = pos + TAG.length;
-        const hasQuoteAfter = isQuoteChar(buffer, afterPos);
-
-        if (hasQuoteBefore || hasQuoteAfter) {
-            searchStart = pos + 1;
-            continue;
+    /**
+     * 获取当前未完成匹配的字符数（用于流结束时 flush）
+     * @returns {{ type: 'text'|'thinking', flush: number }}
+     */
+    getPendingFlush() {
+        if (!this.inThinking) {
+            return { type: 'text', flush: this.startMatchPos };
+        } else {
+            return { type: 'thinking', flush: this.endMatchPos };
         }
+    }
 
-        // 只有当标签后面全部是空白字符时才认定为结束标签
-        if (buffer.substring(afterPos).trim() === '') {
-            return pos;
-        }
-
-        searchStart = pos + 1;
+    /**
+     * 重置状态机
+     */
+    reset() {
+        this.startMatchPos = 0;
+        this.endMatchPos = 0;
+        this.inThinking = false;
     }
 }
 
@@ -207,12 +176,12 @@ function findRealThinkingEndTagAtBufferEnd(buffer) {
 class ThinkingStreamContext {
     constructor(thinkingEnabled = false) {
         this.thinkingEnabled = thinkingEnabled;
-        this.hasThinkingTag = false;  // 是否检测到 <thinking> 标签
-        this.inThinkingBlock = false;  // 是否在 thinking 块内
         this.thinkingBlockIndex = null;
         this.textBlockIndex = null;
         this.nextBlockIndex = 0;
         this.thinkingContent = '';
+        // 使用状态机匹配器
+        this.matcher = new ThinkingTagMatcher();
     }
 
     /**
@@ -235,83 +204,51 @@ class ThinkingStreamContext {
             return this.createTextDeltaEvents(content);
         }
 
-        // 首次检测：使用 findRealThinkingStartTag 检查是否有真正的 <thinking> 标签
-        if (!this.hasThinkingTag && !this.inThinkingBlock) {
-            if (findRealThinkingStartTag(content) !== null) {
-                this.hasThinkingTag = true;
-            }
-        }
+        // 使用状态机逐字符处理
+        for (const char of content) {
+            const { type, output, flush, event } = this.matcher.feed(char);
 
-        // 如果确定没有 thinking 标签，直接作为普通文本输出
-        if (!this.hasThinkingTag) {
-            return this.createTextDeltaEvents(content);
-        }
-
-        // 有 thinking 标签，进行处理
-        let remainingContent = content;
-
-        while (remainingContent.length > 0) {
-            if (!this.inThinkingBlock) {
-                // 查找 <thinking> 开始标签
-                const startPos = findRealThinkingStartTag(remainingContent);
-                if (startPos !== null) {
-                    // 发送 <thinking> 之前的内容作为 text_delta
-                    const beforeThinking = remainingContent.substring(0, startPos);
-                    if (beforeThinking) {
-                        events.push(...this.createTextDeltaEvents(beforeThinking));
-                    }
-
-                    // 进入 thinking 块
-                    this.inThinkingBlock = true;
-                    remainingContent = remainingContent.substring(startPos + '<thinking>'.length);
-
-                    // 创建 thinking 块的 content_block_start 事件
-                    this.thinkingBlockIndex = this.getNextBlockIndex();
-                    events.push({
-                        type: 'content_block_start',
-                        index: this.thinkingBlockIndex,
-                        content_block: {
-                            type: 'thinking',
-                            thinking: ''
-                        }
-                    });
+            // 处理 flush（匹配失败时需要输出之前部分匹配的标签字符）
+            if (flush > 0) {
+                const flushStr = type === 'text' 
+                    ? THINKING_START_TAG.substring(0, flush) 
+                    : THINKING_END_TAG.substring(0, flush);
+                if (type === 'text') {
+                    events.push(...this.createTextDeltaEvents(flushStr));
                 } else {
-                    // 没有找到 <thinking> 标签，全部作为文本输出
-                    if (remainingContent) {
-                        events.push(...this.createTextDeltaEvents(remainingContent));
-                    }
-                    break;
+                    this.thinkingContent += flushStr;
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, flushStr));
                 }
-            } else {
-                // 在 thinking 块内，查找 </thinking> 结束标签
-                const endPos = findRealThinkingEndTag(remainingContent);
-                if (endPos !== null) {
-                    // 提取 thinking 内容
-                    const thinkingContent = remainingContent.substring(0, endPos);
-                    if (thinkingContent) {
-                        this.thinkingContent += thinkingContent;
-                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, thinkingContent));
+            }
+
+            // 处理事件（标签匹配完成）
+            if (event === 'start') {
+                // 创建 thinking 块的 content_block_start 事件
+                this.thinkingBlockIndex = this.getNextBlockIndex();
+                events.push({
+                    type: 'content_block_start',
+                    index: this.thinkingBlockIndex,
+                    content_block: {
+                        type: 'thinking',
+                        thinking: ''
                     }
+                });
+            } else if (event === 'end') {
+                // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
+                events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
+                events.push({
+                    type: 'content_block_stop',
+                    index: this.thinkingBlockIndex
+                });
+            }
 
-                    // 结束 thinking 块
-                    this.inThinkingBlock = false;
-
-                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
-                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
-                    events.push({
-                        type: 'content_block_stop',
-                        index: this.thinkingBlockIndex
-                    });
-
-                    remainingContent = remainingContent.substring(endPos + '</thinking>'.length);
+            // 处理输出（当前字符需要输出）
+            if (output) {
+                if (type === 'text') {
+                    events.push(...this.createTextDeltaEvents(char));
                 } else {
-                    // 没有找到结束标签，发送当前全部内容作为 thinking_delta
-                    if (remainingContent) {
-                        this.thinkingContent += remainingContent;
-                        events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, remainingContent));
-                    }
-                    remainingContent = '';
-                    break;
+                    this.thinkingContent += char;
+                    events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, char));
                 }
             }
         }
@@ -367,16 +304,23 @@ class ThinkingStreamContext {
     /**
      * 处理 tool_use 前的 thinking 结束
      * 当 tool_use 紧跟 thinking 时，需要先关闭 thinking 块
-     * 注意：由于不再使用缓冲区，这个方法现在主要用于处理
-     * 思考块没有正确结束的边缘情况
      */
     handleToolUseStart() {
         const events = [];
 
         // 如果在 thinking 块内，需要先关闭它
-        if (this.thinkingEnabled && this.inThinkingBlock) {
+        if (this.thinkingEnabled && this.matcher.inThinking) {
+            // flush 未完成的匹配
+            const { type, flush } = this.matcher.getPendingFlush();
+            if (flush > 0) {
+                const flushStr = THINKING_END_TAG.substring(0, flush);
+                this.thinkingContent += flushStr;
+                events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, flushStr));
+            }
+
             // 关闭 thinking 块
-            this.inThinkingBlock = false;
+            this.matcher.inThinking = false;
+            this.matcher.endMatchPos = 0;
 
             events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
             events.push({
@@ -395,9 +339,18 @@ class ThinkingStreamContext {
         const events = [];
 
         // 如果在 thinking 块内，需要关闭它
-        if (this.thinkingEnabled && this.inThinkingBlock) {
+        if (this.thinkingEnabled && this.matcher.inThinking) {
+            // flush 未完成的匹配
+            const { flush } = this.matcher.getPendingFlush();
+            if (flush > 0) {
+                const flushStr = THINKING_END_TAG.substring(0, flush);
+                this.thinkingContent += flushStr;
+                events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, flushStr));
+            }
+
             // 关闭 thinking 块
-            this.inThinkingBlock = false;
+            this.matcher.inThinking = false;
+            this.matcher.endMatchPos = 0;
 
             events.push(this.createThinkingDeltaEvent(this.thinkingBlockIndex, ''));
             events.push({
@@ -427,37 +380,17 @@ function extractThinkingFromText(text) {
     let thinking = null;
     let content = text;
 
-    const startPos = findRealThinkingStartTag(text);
-    if (startPos !== null) {
+    const startPos = text.indexOf(THINKING_START_TAG);
+    if (startPos !== -1) {
         // 找到开始标签，查找结束标签
-        const afterStart = text.substring(startPos + '<thinking>'.length);
+        const afterStart = text.substring(startPos + THINKING_START_TAG.length);
+        const endPos = afterStart.indexOf(THINKING_END_TAG);
         
-        // 在剩余文本中查找结束标签
-        let endPos = null;
-        let searchStart = 0;
-        const TAG = '</thinking>';
-        
-        while (true) {
-            const pos = afterStart.indexOf(TAG, searchStart);
-            if (pos === -1) break;
-            
-            // 检查是否被引用字符包裹
-            const hasQuoteBefore = pos > 0 && isQuoteChar(afterStart, pos - 1);
-            const afterPos = pos + TAG.length;
-            const hasQuoteAfter = isQuoteChar(afterStart, afterPos);
-            
-            if (!hasQuoteBefore && !hasQuoteAfter) {
-                endPos = pos;
-                break;
-            }
-            searchStart = pos + 1;
-        }
-        
-        if (endPos !== null) {
+        if (endPos !== -1) {
             thinking = afterStart.substring(0, endPos);
             // 内容是开始标签之前的部分 + 结束标签之后的部分
             const beforeThinking = text.substring(0, startPos);
-            const afterThinking = afterStart.substring(endPos + TAG.length);
+            const afterThinking = afterStart.substring(endPos + THINKING_END_TAG.length);
             content = (beforeThinking + afterThinking).trim();
             
             // 移除开头的双换行符（thinking 结束标签后通常有 \n\n）
