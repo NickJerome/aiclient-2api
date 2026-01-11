@@ -18,7 +18,7 @@ import {
     GEMINI_DEFAULT_INPUT_TOKEN_LIMIT,
     GEMINI_DEFAULT_OUTPUT_TOKEN_LIMIT
 } from '../utils.js';
-import { MODEL_PROTOCOL_PREFIX } from '../../common.js';
+import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -28,7 +28,7 @@ import {
     generateContentPartDone,
     generateOutputItemDone,
     generateResponseCompleted
-} from '../../openai/openai-responses-core.mjs';
+} from '../../providers/openai/openai-responses-core.mjs';
 
 /**
  * Claude转换器类
@@ -607,12 +607,16 @@ export class ClaudeConverter extends BaseConverter {
     toOpenAIModelList(claudeModels) {
         return {
             object: "list",
-            data: claudeModels.models.map(m => ({
-                id: m.id || m.name,
-                object: "model",
-                created: Math.floor(Date.now() / 1000),
-                owned_by: "anthropic",
-            })),
+            data: claudeModels.models.map(m => {
+                const modelId = m.id || m.name;
+                return {
+                    id: modelId,
+                    object: "model",
+                    created: Math.floor(Date.now() / 1000),
+                    owned_by: "anthropic",
+                    display_name: modelId,
+                };
+            }),
         };
     }
 

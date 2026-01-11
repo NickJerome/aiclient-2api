@@ -14,7 +14,7 @@ import {
     CLAUDE_DEFAULT_TEMPERATURE,
     CLAUDE_DEFAULT_TOP_P
 } from '../utils.js';
-import { MODEL_PROTOCOL_PREFIX } from '../../common.js';
+import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -24,7 +24,7 @@ import {
     generateContentPartDone,
     generateOutputItemDone,
     generateResponseCompleted
-} from '../../openai/openai-responses-core.mjs';
+} from '../../providers/openai/openai-responses-core.mjs';
 
 /**
  * Gemini转换器类
@@ -289,12 +289,16 @@ export class GeminiConverter extends BaseConverter {
     toOpenAIModelList(geminiModels) {
         return {
             object: "list",
-            data: geminiModels.models.map(m => ({
-                id: m.name.startsWith('models/') ? m.name.substring(7) : m.name,
-                object: "model",
-                created: Math.floor(Date.now() / 1000),
-                owned_by: "google",
-            })),
+            data: geminiModels.models.map(m => {
+                const modelId = m.name.startsWith('models/') ? m.name.substring(7) : m.name;
+                return {
+                    id: modelId,
+                    object: "model",
+                    created: Math.floor(Date.now() / 1000),
+                    owned_by: "google",
+                    display_name: m.displayName || modelId,
+                };
+            }),
         };
     }
 

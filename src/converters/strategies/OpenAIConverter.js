@@ -22,7 +22,7 @@ import {
     OPENAI_DEFAULT_INPUT_TOKEN_LIMIT,
     OPENAI_DEFAULT_OUTPUT_TOKEN_LIMIT
 } from '../utils.js';
-import { MODEL_PROTOCOL_PREFIX } from '../../common.js';
+import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -32,7 +32,7 @@ import {
     generateContentPartDone,
     generateOutputItemDone,
     generateResponseCompleted
-} from '../../openai/openai-responses-core.mjs';
+} from '../../providers/openai/openai-responses-core.mjs';
 
 /**
  * OpenAI转换器类
@@ -103,8 +103,25 @@ export class OpenAIConverter extends BaseConverter {
             case MODEL_PROTOCOL_PREFIX.GEMINI:
                 return this.toGeminiModelList(data);
             default:
-                return data;
+                return this.ensureDisplayName(data);
         }
+    }
+
+    /**
+     * Ensure display_name field exists in OpenAI model list
+     */
+    ensureDisplayName(openaiModels) {
+        if (!openaiModels || !openaiModels.data) {
+            return openaiModels;
+        }
+
+        return {
+            ...openaiModels,
+            data: openaiModels.data.map(model => ({
+                ...model,
+                display_name: model.display_name || model.id,
+            })),
+        };
     }
 
     // =========================================================================
